@@ -69,6 +69,7 @@ public final class MonoProcessor<O> extends Mono<O>
 	volatile O               value;
 	volatile Throwable       error;
 	volatile int             state;
+	volatile int             subscriptionState;
 	volatile int             wip;
 	volatile int             requested;
 	MonoProcessor(Publisher<? extends O> source) {
@@ -79,7 +80,7 @@ public final class MonoProcessor<O> extends Mono<O>
 	public final void cancel() {
 		int state = this.state;
 		for (; ; ) {
-			if (state != STATE_READY && state != STATE_SUBSCRIBED && state != STATE_POST_SUBSCRIBED) {
+			if (state != STATE_READY && state != STATE_IN_PROGRESS) {
 				return;
 			}
 			if (STATE.compareAndSet(this, state, STATE_CANCELLED)) {
@@ -118,7 +119,7 @@ public final class MonoProcessor<O> extends Mono<O>
 			if (!isPending()) {
 				return peek();
 			}
-			else if(subscription == null) {
+			else if(subscription == null && this.state != STATE_IN_PROGRESS) {
 				getOrStart();
 			}
 
@@ -211,7 +212,7 @@ public final class MonoProcessor<O> extends Mono<O>
 
 	@Override
 	public final boolean isTerminated() {
-		return state > STATE_POST_SUBSCRIBED;
+		return state > STATE_IN_PROGRESS;
 	}
 
 	@Override
@@ -238,7 +239,7 @@ public final class MonoProcessor<O> extends Mono<O>
 
 		int state = this.state;
 		for (; ; ) {
-			if (state != STATE_READY && state != STATE_SUBSCRIBED && state != STATE_POST_SUBSCRIBED) {
+			if (state != STATE_READY && state != STATE_IN_PROGRESS) {
 				Exceptions.onErrorDropped(cause);
 				return;
 			}
@@ -284,7 +285,7 @@ public final class MonoProcessor<O> extends Mono<O>
 		}
 		int state = this.state;
 		for (; ; ) {
-			if (state != STATE_READY && state != STATE_SUBSCRIBED && state != STATE_POST_SUBSCRIBED) {
+			if (state != STATE_READY && state != STATE_IN_PROGRESS) {
 				if(value != null) {
 					Exceptions.onNextDropped(value);
 				}
@@ -306,7 +307,8 @@ public final class MonoProcessor<O> extends Mono<O>
 	public final void onSubscribe(Subscription subscription) {
 		if (BackpressureUtils.validate(this.subscription, subscription)) {
 			this.subscription = subscription;
-			if (STATE.compareAndSet(this, STATE_READY, STATE_SUBSCRIBED)){
+			if (STATE.compareAndSet(this, STATE_READY, STATE_IN_PROGRESS)){
+				SUBSCRIPTION_STATE.compareAndSet(this, SUBSCRIPTION_REQUESTED, SUBSCRIPTION_IN_PROGRESS);
 				subscription.request(Long.MAX_VALUE);
 			}
 
@@ -379,6 +381,7 @@ public final class MonoProcessor<O> extends Mono<O>
 			EmptySubscription.error(subscriber, error);
 			return;
 		}
+		SUBSCRIPTION_STATE.compareAndSet(this, SUBSCRIPTION_NONE, SUBSCRIPTION_REQUESTED);
 		Processor<O, O> out = getOrStart();
 		out.subscribe(subscriber);
 		if (WIP.getAndIncrement(this) == 0) {
@@ -398,6 +401,7 @@ public final class MonoProcessor<O> extends Mono<O>
 
 	final boolean checkStarted(){
 		int state = this.state;
+		int subscriptionState = this.subscriptionState;
 		if(state == STATE_ERROR){
 			if (RuntimeException.class.isInstance(error)) {
 				throw (RuntimeException) error;
@@ -407,7 +411,7 @@ public final class MonoProcessor<O> extends Mono<O>
 				return false;
 			}
 		}
-		return state > STATE_READY && subscription != null && state > STATE_POST_SUBSCRIBED;
+		return state > STATE_READY && subscription != null && state > STATE_IN_PROGRESS;
 	}
 
 	@SuppressWarnings("unchecked")
@@ -415,9 +419,11 @@ public final class MonoProcessor<O> extends Mono<O>
 		int missed = 1;
 
 		int state;
+		int subscriptionState;
 		for (; ; ) {
 			state = this.state;
-			if (state > STATE_POST_SUBSCRIBED) {
+			subscriptionState = this.subscriptionState;
+			if (state > STATE_IN_PROGRESS) {
 				Processor<O, O> p = (Processor<O, O>) PROCESSOR.getAndSet(this, NOOP_PROCESSOR);
 				if (p != NOOP_PROCESSOR && p != null) {
 					switch (state) {
@@ -445,7 +451,8 @@ public final class MonoProcessor<O> extends Mono<O>
 				}
 			}
 
-			if (state == STATE_SUBSCRIBED && STATE.compareAndSet(this, STATE_SUBSCRIBED, STATE_POST_SUBSCRIBED)) {
+			if (state == STATE_IN_PROGRESS && subscriptionState == SUBSCRIPTION_IN_PROGRESS
+					&& SUBSCRIPTION_STATE.compareAndSet(this, SUBSCRIPTION_IN_PROGRESS, SUBSCRIPTION_OK)) {
 				Processor<O, O> p = (Processor<O, O>) PROCESSOR.get(this);
 				if (p != null && p != NOOP_PROCESSOR) {
 					p.onSubscribe(this);
@@ -514,15 +521,21 @@ public final class MonoProcessor<O> extends Mono<O>
 	final static NoopProcessor NOOP_PROCESSOR = new NoopProcessor();
 	final static AtomicIntegerFieldUpdater<MonoProcessor>              STATE     =
 			AtomicIntegerFieldUpdater.newUpdater(MonoProcessor.class, "state");
+	final static AtomicIntegerFieldUpdater<MonoProcessor>              SUBSCRIPTION_STATE     =
+			AtomicIntegerFieldUpdater.newUpdater(MonoProcessor.class, "subscriptionState");
 	final static AtomicIntegerFieldUpdater<MonoProcessor>              WIP       =
 			AtomicIntegerFieldUpdater.newUpdater(MonoProcessor.class, "wip");
 	final static AtomicReferenceFieldUpdater<MonoProcessor, Processor> PROCESSOR =
 			PlatformDependent.newAtomicReferenceFieldUpdater(MonoProcessor.class, "processor");
 	final static int       STATE_CANCELLED         = -1;
 	final static int       STATE_READY             = 0;
-	final static int       STATE_SUBSCRIBED        = 1;
-	final static int       STATE_POST_SUBSCRIBED   = 2;
-	final static int       STATE_SUCCESS_VALUE     = 3;
-	final static int       STATE_COMPLETE_NO_VALUE = 4;
-	final static int       STATE_ERROR             = 5;
+	final static int       STATE_IN_PROGRESS       = 1;
+	final static int       STATE_SUCCESS_VALUE     = 2;
+	final static int       STATE_COMPLETE_NO_VALUE = 3;
+	final static int       STATE_ERROR             = 4;
+
+	final static int       SUBSCRIPTION_NONE = 0;
+	final static int       SUBSCRIPTION_REQUESTED = 1;
+	final static int       SUBSCRIPTION_IN_PROGRESS = 2;
+	final static int       SUBSCRIPTION_OK = 3;
 }
